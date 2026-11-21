@@ -1,0 +1,10 @@
+#!/bin/sh
+# prepare-commit-msg：只在开编辑器时塞注释模板；git commit -m 一律不碰。
+[ -n "$2" ] && exit 0
+cat >> "$1" <<'EOF'
+
+# ---- type(scope): 中文说明，≤50 字符，句末不加句号 ----
+# 空一行写为什么 / 影响面 / 取舍，用 - 列表
+# Refs: <工单>   Verified: <跑过的命令>   Co-authored-by: <agent>
+EOF
+exit 0

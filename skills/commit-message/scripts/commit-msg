@@ -1,0 +1,55 @@
+#!/bin/sh
+# commit-msg 校验：type(scope): 中文说明（≤50 字符）+ 必要的正文与 Refs。
+# 由 ~/.githooks/commit-msg 软链调用；规则见 references/rules.md
+LC_ALL=en_US.UTF-8
+export LC_ALL
+
+# 拒绝时统一带上「改消息不绕过」——agent 一定看到这句，比 skill 正文更可靠
+deny() {
+  printf '✗ %s\n  改消息，不要用 --no-verify 绕过\n' "$1" >&2
+  exit 1
+}
+
+msgfile=$1
+first=$(head -1 "$msgfile")
+
+case "$first" in
+  Merge*|Revert*|fixup!*|squash!*|Auto-merged*) exit 0 ;;
+esac
+
+[ -n "$first" ] || deny "提交信息为空"
+
+types='feat|fix|docs|test|refactor|perf|chore|build|ci|style|revert'
+
+if ! printf '%s\n' "$first" | grep -qE "^($types)\([a-z0-9][a-z0-9._/-]*\)!?: [^ ]"; then
+  {
+    echo "✗ 标题格式不对，需要：type(scope): 中文说明"
+    echo "  type   feat fix docs test refactor perf chore build ci style revert"
+    echo "  scope  必填、小写英文，取目录名或领域词，如 fix(proxy): 修正负缓存 TTL"
+    echo "  改消息，不要用 --no-verify 绕过"
+  } >&2
+  exit 1
+fi
+
+len=$(printf '%s' "$first" | wc -m | tr -d ' ')
+[ "$len" -le 50 ] || deny "标题 ${len} 字符，上限 50。枚举、文件名清单、并列项移进正文"
+
+desc=$(printf '%s' "$first" | sed -E 's/^[a-z]+\([^)]*\)!?:[[:space:]]*//')
+case "$desc" in
+  更新|更新。|修改|修改。|修复|修复。|优化|优化。|调整|调整。|测试|测试。|保存当前更改|1|.|\
+  update|update\.|fix|fix\.|changes|change|misc|various|wip)
+    deny "标题空泛：「${desc}」。写清改了什么、为什么" ;;
+esac
+
+body=$(tail -n +2 "$msgfile" | grep -v '^#' | sed '/^[[:space:]]*$/d')
+lines=$(git diff --cached --numstat 2>/dev/null | awk '{a+=$1; d+=$2} END{print a+d+0}')
+[ -n "$body" ] || [ "${lines:-0}" -le 100 ] ||
+  deny "改动 ${lines} 行却没有正文。空一行后写为什么、影响面，用 - 列表"
+
+# 只认方括号工单号与 #issue；裸 SS-220 不匹配，避免 UTF-8 / AES-256 之类误判
+if grep -qE '(\[[A-Za-z][A-Za-z0-9]*-[0-9]+\]|#[0-9]+)' "$msgfile"; then
+  printf '%s\n' "$body" | grep -qE '^Refs:[[:space:]]*[^[:space:]]' ||
+    deny "提到工单或 issue，正文末尾必须写：Refs: <ID>"
+fi
+
+exit 0

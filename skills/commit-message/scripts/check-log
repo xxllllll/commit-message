@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""历史 commit 体检：只报不改写。用法：check-log [root] [--limit=N] [--all|--author=X] [--json]"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+TYPES = "feat fix docs test refactor perf chore build ci style revert".split()
+STRUCT = re.compile(r"^(" + "|".join(TYPES) + r")\(([a-z0-9][a-z0-9._/-]*)\)!?: \S")
+VAGUE = re.compile(r"^(更新|修改|修复|优化|调整|测试|保存当前更改|1|\.|update|fix|changes?|misc|various|wip)\.?$", re.I)
+FILEY = re.compile(r"^(Update|Create|Delete|Add|Rename|Update and rename)\b")
+TICKET_HEAD = re.compile(r"^\[[A-Za-z][A-Za-z0-9]*-\d+\]")
+SKIP = re.compile(r"^(Merge |Revert |fixup! |squash! )")
+
+
+def repo_commits(path, limit, author=None):
+    fmt = "%H%x09%ad%x09%s"
+    cmd = ["git", "-C", path, "log", "--no-merges", f"-n{limit}", f"--format={fmt}", "--date=short"]
+    if author:
+        cmd.append(f"--author={author}")
+    out = subprocess.run(cmd, capture_output=True, text=True)
+    rows = []
+    for line in out.stdout.splitlines():
+        parts = line.split("\t", 2)
+        rows.append(tuple(parts) if len(parts) == 3 else (line, "", ""))
+    return rows
+
+
+def default_author(path):
+    out = subprocess.run(["git", "-C", path, "config", "user.email"], capture_output=True, text=True)
+    return out.stdout.strip() or None
+
+
+def audit(root, limit, all_authors=False, author=None):
+    result = []
+    # root 自己就是仓库时只看它，否则看它下一层
+    entries = [("", root)] if os.path.exists(os.path.join(root, ".git")) else [
+        (e, os.path.join(root, e)) for e in sorted(os.listdir(root))
+    ]
+    for entry, path in entries:
+        if not os.path.exists(os.path.join(path, ".git")):
+            continue
+        entry = entry or os.path.basename(os.path.abspath(path))
+        a = None if all_authors else (author or default_author(path))
+        rows = repo_commits(path, limit, a)
+        if not rows:
+            continue
+        st = {"repo": entry, "n": len(rows), "struct": 0, "long": 0, "vague": 0, "ticket": 0, "filey": 0}
+        bad_shas = set()
+        worst = []
+        for sha, date, subj in rows:
+            bad = []
+            if SKIP.match(subj):
+                continue
+            if not STRUCT.match(subj):
+                st["struct"] += 1
+                bad.append("结构")
+            if len(subj) > 50:
+                st["long"] += 1
+                bad.append(f"长度{len(subj)}")
+            if VAGUE.match(subj.strip()):
+                st["vague"] += 1
+                bad.append("空泛")
+            if FILEY.match(subj):
+                st["filey"] += 1
+                bad.append("文件名")
+            if TICKET_HEAD.match(subj):
+                st["ticket"] += 1
+                bad.append("工单占标题")
+            if bad:
+                bad_shas.add(sha)
+                worst.append((sha[:7], date, "/".join(bad), subj[:60]))
+        st["bad"] = len(bad_shas)
+        st["ok"] = round(100 * (1 - st["bad"] / st["n"]), 1)
+        st["worst"] = worst[:3]
+        result.append(st)
+    return result
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    root = args[0] if args else "."
+    limit = 200
+    author = None
+    for a in sys.argv[1:]:
+        if a.startswith("--limit"):
+            limit = int(a.split("=", 1)[1])
+        elif a.startswith("--author="):
+            author = a.split("=", 1)[1]
+    rows = audit(root, limit, all_authors="--all" in sys.argv, author=author)
+    if "--json" in sys.argv:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+    if not rows:
+        print(f"{root} 下没有仓库")
+        return
+    hdr = f"{'仓库':26}{'条数':>6}{'合规%':>8}{'结构':>6}{'长度':>6}{'空泛':>6}{'文件名':>8}{'工单':>6}"
+    print(hdr)
+    print("-" * 76)
+    for r in sorted(rows, key=lambda x: x["ok"]):
+        print(f"{r['repo'][:26]:26}{r['n']:6}{r['ok']:8}{r['struct']:6}{r['long']:6}{r['vague']:6}{r['filey']:8}{r['ticket']:6}")
+    total = sum(r["n"] for r in rows)
+    bad = sum(r["bad"] for r in rows)
+    print("-" * 60)
+    scope = "全部作者" if "--all" in sys.argv else (author or "本仓库 git config user.email")
+    print(f"合计 {len(rows)} 个仓库 / {total} 条（{scope}，近 {limit} 条/仓库），违规 {bad} 条，净合规 {round(100*(1-bad/total),1)}%")
+    print("\n最该改的几条：")
+    for r in sorted(rows, key=lambda x: -x["bad"])[:3]:
+        for sha, date, why, subj in r["worst"]:
+            print(f"  {r['repo']:20} {sha} {date} [{why}] {subj}")
+
+
+if __name__ == "__main__":
+    main()

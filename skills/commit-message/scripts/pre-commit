@@ -1,0 +1,5 @@
+#!/bin/sh
+# 设了 core.hooksPath 后 .git/hooks 会被整体忽略；这个转发器保住其它仓库自带的 pre-commit。
+d=$(git rev-parse --git-common-dir 2>/dev/null) || exit 0
+[ -x "$d/hooks/pre-commit" ] && exec "$d/hooks/pre-commit"
+exit 0

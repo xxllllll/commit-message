@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""ADR 只读体检与取号脚本：只报不改写。
+
+用法：
+  check-adr [path] [--next] [--json] [--strict]
+
+path 解析顺序：
+  1. 若 path 本身包含 NNNN-*.md，直接检查该目录；
+  2. 若 path/docs/adr 存在，检查该目录；
+  3. 否则扫描 path 下一层所有包含 docs/adr 的子目录（批量体检多仓库）。
+"""
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+ADR_FILE_RE = re.compile(r"^(\d{4})-([a-z0-9][a-z0-9-]*)\.md$")
+NUM_PREFIX_RE = re.compile(r"^(\d+)-.*\.md$")
+TITLE_RE = re.compile(r"^#\s+(.+?)\s*$")
+TITLE_NUM_RE = re.compile(r"\bADR[- ]?(\d{3,5})\b", re.I)
+STATUS_RE = re.compile(r"(?:^|\s|[-*•|｜。；;])(状态|Status)\s*[:：]\s*\S+", re.I)
+DATE_RE = re.compile(r"(?:日期|最后复核|Date)\s*[:：]\s*\d{4}-\d{2}-\d{2}", re.I)
+MD_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)#\s]+?\.md)(?:#[^)\s]*)?\)")
+ADR_REF_RE = re.compile(r"\bADR-(\d{4})\b")
+HEADING_RE = re.compile(r"^#{2,3}\s+(.+?)\s*$")
+
+IGNORED_MD = {"readme.md", "index.md", "template.md", "templates.md"}
+PLACEHOLDER_NUMS = {"0000"}
+
+CTX_KW = ("背景", "问题", "现状", "context", "background", "motivation", "problem")
+DEC_KW = ("决定", "决策", "方案", "decision", "proposal", "design")
+TRADE_KW = ("放弃", "否决", "不做", "后果", "影响", "取舍", "代价", "consequence", "alternative", "non-goal", "trade")
+
+MAX_BYTES = 15 * 1024
+MAX_LINES = 250
+
+
+def strip_fenced_code(text: str) -> str:
+    """移除 fenced code block，避免模板或示例触发误报。"""
+    out = []
+    in_fence = False
+    fence_char = ""
+    for line in text.splitlines():
+        s = line.lstrip()
+        if not in_fence and (s.startswith("```") or s.startswith("~~~")):
+            in_fence = True
+            fence_char = s[:3]
+            out.append("")
+            continue
+        if in_fence:
+            if s.startswith(fence_char):
+                in_fence = False
+            out.append("")
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def has_adr_files(directory: Path) -> bool:
+    if not directory.is_dir():
+        return False
+    return any(
+        p.is_file() and p.suffix == ".md" and (ADR_FILE_RE.match(p.name) or NUM_PREFIX_RE.match(p.name))
+        for p in directory.iterdir()
+    )
+
+
+def discover_targets(raw_path: str) -> list[tuple[str, Path]]:
+    p = Path(raw_path).resolve()
+    if not p.exists():
+        return []
+    if p.is_dir():
+        if has_adr_files(p):
+            label = p.parent.parent.name if p.name == "adr" and p.parent.name == "docs" else p.name
+            return [(label, p)]
+        docs_adr = p / "docs" / "adr"
+        if docs_adr.is_dir():
+            return [(p.name, docs_adr)]
+        if p.name == "adr" and p.parent.name == "docs":
+            return [(p.parent.parent.name, p)]
+        # 扫描下一层多仓库
+        targets = []
+        for child in sorted(p.iterdir()):
+            if child.is_dir() and not child.name.startswith("."):
+                sub = child / "docs" / "adr"
+                if sub.is_dir():
+                    targets.append((child.name, sub))
+        return targets
+    return []
+
+
+def next_number(directory: Path) -> str:
+    nums = []
+    if directory.is_dir():
+        for p in directory.iterdir():
+            if not p.is_file() or p.suffix != ".md":
+                continue
+            m = NUM_PREFIX_RE.match(p.name)
+            if m:
+                nums.append(int(m.group(1)))
+    nxt = (max(nums) + 1) if nums else 1
+    return f"{nxt:04d}"
+
+
+def find_gaps(sorted_nums: list[int]) -> list[str]:
+    if not sorted_nums:
+        return []
+    gaps = []
+    expected = 1
+    for n in sorted_nums:
+        if n > expected:
+            if expected == n - 1:
+                gaps.append(f"{expected:04d}")
+            else:
+                gaps.append(f"{expected:04d}-{n - 1:04d}")
+        expected = max(expected, n + 1)
+    return gaps
+
+
+def audit_dir(label: str, directory: Path) -> dict:
+    md_files = sorted(
+        p for p in directory.iterdir()
+        if p.is_file() and p.suffix.lower() == ".md" and p.name.lower() not in IGNORED_MD
+    )
+
+    errors = []
+    warnings = []
+    hints = []
+    by_num: dict[str, list[str]] = {}
+    parsed = []
+
+    for f in md_files:
+        m = ADR_FILE_RE.match(f.name)
+        if not m:
+            errors.append({"file": f.name, "kind": "文件名", "detail": "应符合 NNNN-english-slug.md"})
+            pm = NUM_PREFIX_RE.match(f.name)
+            num = pm.group(1).zfill(4) if pm else None
+        else:
+            num = m.group(1)
+        if num is not None:
+            by_num.setdefault(num, []).append(f.name)
+        parsed.append((f, num))
+
+    for num, names in sorted(by_num.items()):
+        if len(names) > 1:
+            errors.append({"file": ", ".join(names), "kind": "重号", "detail": f"编号 {num} 重复出现 {len(names)} 次"})
+
+    known_nums = set(by_num.keys())
+
+    for f, num in parsed:
+        raw = f.read_text(encoding="utf-8", errors="replace")
+        size_bytes = f.stat().st_size
+        lines = raw.splitlines()
+        cleaned = strip_fenced_code(raw)
+        clean_lines = cleaned.splitlines()
+
+        # 1. 标题与编号核对
+        first_h1 = next((TITLE_RE.match(l) for l in clean_lines[:10] if TITLE_RE.match(l)), None)
+        if not first_h1:
+            errors.append({"file": f.name, "kind": "缺标题", "detail": "前 10 行未找到一级标题 # ..."})
+        elif num is not None:
+            tm = TITLE_NUM_RE.search(first_h1.group(1))
+            if tm and tm.group(1).zfill(4) != num:
+                errors.append({
+                    "file": f.name,
+                    "kind": "编号不符",
+                    "detail": f"文件名编号 {num} 与标题 ADR-{tm.group(1)} 不一致",
+                })
+
+        # 2. 头部元信息（前 15 行）
+        header = clean_lines[:15]
+        has_status = any(STATUS_RE.search(l) for l in header)
+        has_date = any(DATE_RE.search(l) for l in header)
+        if not has_status:
+            warnings.append({"file": f.name, "kind": "缺状态", "detail": "头部前 15 行缺少「状态：」或「Status:」"})
+        if not has_date:
+            warnings.append({"file": f.name, "kind": "缺日期", "detail": "头部前 15 行缺少「日期：YYYY-MM-DD」"})
+
+        # 3. 核心章节完整性（仅提示）
+        headings = [HEADING_RE.match(l).group(1).lower() for l in clean_lines if HEADING_RE.match(l)]
+        if headings:
+            has_ctx = any(any(k in h for k in CTX_KW) for h in headings)
+            has_dec = any(any(k in h for k in DEC_KW) for h in headings)
+            has_trade = any(any(k in h for k in TRADE_KW) for h in headings)
+            missing_sec = []
+            if not has_ctx:
+                missing_sec.append("背景")
+            if not has_dec:
+                missing_sec.append("决定")
+            if not has_trade:
+                missing_sec.append("放弃方案/后果")
+            if missing_sec:
+                hints.append({"file": f.name, "kind": "缺章节", "detail": f"建议补充：{'、'.join(missing_sec)}"})
+
+        # 4. 体积预警（防回退成过程流水账）
+        if size_bytes > MAX_BYTES or len(lines) > MAX_LINES:
+            hints.append({
+                "file": f.name,
+                "kind": "超长",
+                "detail": f"{round(size_bytes / 1024, 1)} KB / {len(lines)} 行，建议确认是否混入过程流水账",
+            })
+
+        # 5. 相对 .md 链接存在性
+        seen_links = set()
+        for target in MD_LINK_RE.findall(cleaned):
+            if target.startswith(("http://", "https://", "mailto:")) or target in seen_links:
+                continue
+            seen_links.add(target)
+            resolved = (f.parent / target).resolve()
+            if not resolved.exists():
+                errors.append({"file": f.name, "kind": "断链", "detail": f"链接目标不存在：{target}"})
+
+        # 6. 正文 ADR-NNNN 引用存在性
+        seen_refs = set()
+        for ref_num in ADR_REF_RE.findall(cleaned):
+            if ref_num in PLACEHOLDER_NUMS or ref_num in seen_refs:
+                continue
+            seen_refs.add(ref_num)
+            if ref_num not in known_nums:
+                errors.append({"file": f.name, "kind": "悬空引用", "detail": f"引用了不存在的 ADR-{ref_num}"})
+
+    int_nums = sorted({int(n) for n in known_nums})
+    gaps = find_gaps(int_nums)
+    return {
+        "repo": label,
+        "path": str(directory),
+        "count": len(md_files),
+        "next": f"{(max(int_nums) + 1) if int_nums else 1:04d}",
+        "gaps": gaps,
+        "errors": errors,
+        "warnings": warnings,
+        "hints": hints,
+    }
+
+
+def print_report(results: list[dict]) -> None:
+    hdr = f"{'目标':24}{'篇数':>6}{'下一号':>8}{'错误':>6}{'警告':>6}{'提示':>6}"
+    print(hdr)
+    print("-" * 60)
+    for r in results:
+        print(
+            f"{r['repo'][:24]:24}{r['count']:6}{r['next']:>8}"
+            f"{len(r['errors']):6}{len(r['warnings']):6}{len(r['hints']):6}"
+        )
+
+    for r in results:
+        if r["gaps"]:
+            print(f"\n[{r['repo']}] 历史跳号（仅参考）：{', '.join(r['gaps'])}")
+        if r["errors"]:
+            print(f"\n[{r['repo']}] 错误（{len(r['errors'])}）：")
+            for item in r["errors"]:
+                print(f"  ✗ {item['file']} [{item['kind']}] {item['detail']}")
+        if r["warnings"]:
+            print(f"\n[{r['repo']}] 警告（{len(r['warnings'])}）：")
+            for item in r["warnings"][:15]:
+                print(f"  ! {item['file']} [{item['kind']}] {item['detail']}")
+            if len(r["warnings"]) > 15:
+                print(f"  … 其余 {len(r['warnings']) - 15} 条警告可用 --json 查看")
+        if r["hints"]:
+            print(f"\n[{r['repo']}] 提示（{len(r['hints'])}）：")
+            for item in r["hints"][:10]:
+                print(f"  · {item['file']} [{item['kind']}] {item['detail']}")
+            if len(r["hints"]) > 10:
+                print(f"  … 其余 {len(r['hints']) - 10} 条提示可用 --json 查看")
+
+
+def main() -> int:
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    pos = [a for a in sys.argv[1:] if not a.startswith("--")]
+    raw = pos[0] if pos else "."
+
+    if "--help" in flags or "-h" in sys.argv[1:]:
+        print(__doc__.strip())
+        return 0
+
+    if "--next" in flags:
+        p = Path(raw).resolve()
+        target = p if has_adr_files(p) or (p.name == "adr" and p.parent.name == "docs") else (p / "docs" / "adr")
+        print(next_number(target))
+        return 0
+
+    targets = discover_targets(raw)
+    if not targets:
+        if "--json" in flags:
+            print("[]")
+        else:
+            print(f"{raw} 下未找到 ADR 目录（默认检查 docs/adr）")
+        return 0
+
+    results = [audit_dir(label, d) for label, d in targets]
+    if "--json" in flags:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+    else:
+        print_report(results)
+
+    has_err = any(r["errors"] for r in results)
+    has_warn = any(r["warnings"] for r in results)
+    if has_err or ("--strict" in flags and has_warn):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
